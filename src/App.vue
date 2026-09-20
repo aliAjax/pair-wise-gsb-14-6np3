@@ -1,193 +1,147 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { storeToRefs } from "pinia";
+import {
+  BATCH_STATUS_TEXT,
+  CONFIRM_STATUS_TEXT,
+  FUELS,
+  batchProgress,
+  confirmersOfBatch,
+  currentPrice,
+  itemsOfBatch,
+  nextBatchNo,
+  type PriceBatch,
+  type RuleResult
+} from "./domain/pricing";
+import { usePricingStore } from "./stores/pricing";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = usePricingStore();
+const { state } = storeToRefs(store);
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const STATUS_FILTERS = ["全部状态", "下发中", "已生效", "已撤回"] as const;
 
-const project = {
-  "number": 9,
-  "folder": "dfwl/frontend/dfwlfront-9",
-  "framework": "vue",
-  "title": "油品价格维护",
-  "subtitle": "维护挂牌价、记录更新时间，并支持恢复默认价格。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-9-price",
-  "formTitle": "调整油品价格",
-  "primaryAction": "保存价格",
-  "entityLabel": "油品",
-  "statuses": [
-    "生效中",
-    "待确认",
-    "已回退"
-  ],
-  "filters": [
-    "全部油品",
-    "92号汽油",
-    "95号汽油",
-    "98号汽油",
-    "柴油"
-  ],
-  "fields": [
-    {
-      "key": "fuel",
-      "label": "油品",
-      "type": "select",
-      "options": [
-        "92号汽油",
-        "95号汽油",
-        "98号汽油",
-        "柴油"
-      ]
-    },
-    {
-      "key": "price",
-      "label": "挂牌价",
-      "type": "number"
-    },
-    {
-      "key": "operator",
-      "label": "操作员"
-    },
-    {
-      "key": "effectiveDate",
-      "label": "生效日期",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "fuel": "92号汽油",
-      "price": 7.62,
-      "operator": "站长",
-      "effectiveDate": "2026-06-30",
-      "status": "生效中",
-      "notes": "正常调价"
-    },
-    {
-      "fuel": "柴油",
-      "price": 7.18,
-      "operator": "值班经理",
-      "effectiveDate": "2026-06-30",
-      "status": "待确认",
-      "notes": "等待复核"
-    }
-  ],
-  "metricLabels": [
-    "油品数",
-    "待确认",
-    "平均挂牌价"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
-
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+const form = reactive({
+  stationId: state.value.stations[0]?.id ?? "",
+  fuel: FUELS[0] as string,
+  targetPrice: null as number | null,
+  operator: "站长",
+  note: ""
 });
+
+const statusFilter = ref<(typeof STATUS_FILTERS)[number]>("全部状态");
+const feedback = ref<{ type: "success" | "error"; text: string } | null>(null);
+const expanded = reactive(new Set<string>());
+const confirmerDrafts = reactive<Record<string, string>>({});
+
+const nextBatch = computed(() => nextBatchNo(state.value.batchSeq));
+const listedPrice = computed(() => currentPrice(state.value, form.stationId, form.fuel));
 
 const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
+  const batches = state.value.batches;
+  const dispatchingIds = new Set(batches.filter((batch) => batch.status === "dispatching").map((batch) => batch.id));
+  const pending = state.value.items.filter(
+    (item) => item.status === "pending" && dispatchingIds.has(item.batchId)
+  ).length;
+  return [
+    { label: "调价批次", value: batches.length },
+    { label: "下发中", value: dispatchingIds.size },
+    { label: "待确认派发项", value: pending },
+    { label: "已生效批次", value: batches.filter((batch) => batch.status === "effective").length }
+  ];
 });
 
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
+const filteredBatches = computed(() => {
+  if (statusFilter.value === "全部状态") return state.value.batches;
+  const text = statusFilter.value as string;
+  return state.value.batches.filter((batch) => BATCH_STATUS_TEXT[batch.status] === text);
+});
 
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
+const historyRows = computed(() =>
+  [...state.value.history].reverse().map((entry) => ({
+    ...entry,
+    stationName: stationName(entry.stationId),
+    confirmers:
+      entry.batchId === "INIT"
+        ? "—"
+        : confirmersOfBatch(state.value, entry.batchId)
+            .map((row) => `${row.terminalLabel}·${row.confirmer}`)
+            .join("、") || "—"
+  }))
+);
 
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+function stationName(stationId: string) {
+  return state.value.stations.find((station) => station.id === stationId)?.name ?? stationId;
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+function apply(result: RuleResult) {
+  feedback.value = { type: result.ok ? "success" : "error", text: result.message };
 }
 
 function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
+  const result = store.create({
+    stationId: form.stationId,
+    fuel: form.fuel,
+    targetPrice: Number(form.targetPrice),
+    operator: form.operator,
+    note: form.note
+  });
+  apply(result);
+  if (result.ok) {
+    form.targetPrice = null;
+    form.note = "";
+  }
 }
 
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+function toggleExpand(batch: PriceBatch) {
+  if (expanded.has(batch.id)) {
+    expanded.delete(batch.id);
+  } else {
+    expanded.add(batch.id);
+    confirmerDrafts[batch.id] = confirmerDrafts[batch.id] ?? batch.operator;
+  }
 }
 
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function report(batch: PriceBatch, terminalId: string) {
+  const confirmer = (confirmerDrafts[batch.id] ?? "").trim() || batch.operator;
+  apply(store.report({ batchId: batch.id, terminalId, confirmer }));
+}
+
+function withdraw(batch: PriceBatch) {
+  if (!window.confirm(`确认撤回批次 ${batch.batchNo}？将释放全部派发项。`)) return;
+  apply(store.withdraw(batch.id));
+}
+
+function toggleOnline(stationId: string, terminalId: string) {
+  store.setOnline(stationId, terminalId, !terminalOnline(stationId, terminalId));
+}
+
+function terminalOnline(stationId: string, terminalId: string) {
+  return (
+    state.value.stations
+      .find((station) => station.id === stationId)
+      ?.terminals.find((terminal) => terminal.id === terminalId)?.online ?? false
+  );
+}
+
+function progressOf(batchId: string) {
+  return batchProgress(state.value, batchId);
+}
+
+function progressPct(batchId: string) {
+  const { confirmed, total } = progressOf(batchId);
+  return total === 0 ? 0 : Math.round((confirmed / total) * 100);
+}
+
+function itemsOf(batchId: string) {
+  return itemsOfBatch(state.value, batchId);
+}
+
+function fmtTime(iso: string) {
+  return new Date(iso).toLocaleString("zh-CN", { hour12: false });
+}
+
+function fmtPrice(price: number | null) {
+  return price == null ? "—" : `¥${price.toFixed(2)}`;
 }
 </script>
 
@@ -196,77 +150,174 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">石油行业 · 价格牌下发确认闭环</p>
+          <h1>油品价格维护</h1>
+          <p class="subtitle">
+            每笔调价选定站点、油品、目标价并生成批次；价格牌与每把油枪各自回报确认，全部回报后挂牌价才生效并冻结批次。
+          </p>
         </div>
         <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+          <span class="tag">Vue3</span>
+          <span class="tag">Vite</span>
+          <span class="tag">TypeScript</span>
+          <span class="tag">Pinia</span>
+          <span class="tag">localStorage</span>
         </div>
       </header>
 
       <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
+        <article v-for="metric in metrics" :key="metric.label" class="metric">
+          <span>{{ metric.label }}</span>
+          <strong>{{ metric.value }}</strong>
         </article>
       </section>
 
+      <p v-if="feedback" class="banner" :class="{ error: feedback.type === 'error' }">{{ feedback.text }}</p>
+
       <section class="workspace">
         <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
+          <h2>新建调价下发</h2>
           <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
+            <label>
+              站点
+              <select v-model="form.stationId" required>
+                <option v-for="station in state.stations" :key="station.id" :value="station.id">
+                  {{ station.name }}
+                </option>
               </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
+            </label>
+            <label>
+              油品
+              <select v-model="form.fuel" required>
+                <option v-for="fuel in FUELS" :key="fuel" :value="fuel">{{ fuel }}</option>
+              </select>
+            </label>
+            <p class="price-now">当前挂牌价：{{ fmtPrice(listedPrice) }} ｜ 批次号：{{ nextBatch }}</p>
+            <label>
+              目标价（元/升）
+              <input v-model.number="form.targetPrice" type="number" step="0.01" min="0.01" placeholder="例如 7.66" required />
+            </label>
+            <label>
+              操作员
+              <input v-model="form.operator" required />
             </label>
             <label>
               备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
+              <textarea v-model="form.note" placeholder="调价原因、通知文号等" />
             </label>
-            <button type="submit">{{ project.primaryAction }}</button>
+            <button type="submit">创建批次并下发</button>
           </div>
         </form>
 
         <section class="list-panel">
           <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
+            <h2>调价批次</h2>
+            <select v-model="statusFilter">
+              <option v-for="item in STATUS_FILTERS" :key="item">{{ item }}</option>
             </select>
           </div>
 
           <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
+            <div v-if="filteredBatches.length === 0" class="empty">暂无批次，请先创建调价</div>
+            <article v-for="batch in filteredBatches" :key="batch.id" class="record">
               <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
+                <p class="record-title">{{ batch.batchNo }} · {{ stationName(batch.stationId) }} · {{ batch.fuel }}</p>
+                <span class="status" :class="batch.status">{{ BATCH_STATUS_TEXT[batch.status] }}</span>
               </div>
               <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
+                <span>目标价: {{ fmtPrice(batch.targetPrice) }}</span>
+                <span>原挂牌价: {{ fmtPrice(batch.oldPrice) }}</span>
+                <span>操作员: {{ batch.operator }}</span>
+                <span>创建: {{ fmtTime(batch.createdAt) }}</span>
+                <span v-if="batch.effectiveAt">生效: {{ fmtTime(batch.effectiveAt) }}</span>
+                <span v-if="batch.withdrawnAt">撤回: {{ fmtTime(batch.withdrawnAt) }}</span>
               </div>
-              <p class="note">{{ record.notes }}</p>
+              <p v-if="batch.note" class="note">{{ batch.note }}</p>
+
+              <div class="progress-row">
+                <div class="bar-track">
+                  <div class="bar-fill" :style="{ width: `${progressPct(batch.id)}%` }" />
+                </div>
+                <span>{{ progressOf(batch.id).confirmed }}/{{ progressOf(batch.id).total }} 已确认</span>
+              </div>
+
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
+                <button type="button" class="secondary" @click="toggleExpand(batch)">
+                  {{ expanded.has(batch.id) ? "收起明细" : "确认明细" }}
+                </button>
+                <button v-if="batch.status === 'dispatching'" type="button" class="danger" @click="withdraw(batch)">
+                  撤回并释放
+                </button>
+                <span v-else-if="batch.status === 'effective'" class="frozen">已冻结，调价需新建批次</span>
+                <span v-else class="frozen">已撤回，派发项全部释放</span>
+              </div>
+
+              <div v-if="expanded.has(batch.id)" class="items">
+                <label class="confirmer">
+                  确认人
+                  <input v-model="confirmerDrafts[batch.id]" placeholder="默认取操作员" />
+                </label>
+                <div class="item-row item-head">
+                  <span>终端</span>
+                  <span>链路</span>
+                  <span>确认项</span>
+                  <span>确认人</span>
+                  <span>确认时间</span>
+                  <span>操作</span>
+                </div>
+                <div v-for="item in itemsOf(batch.id)" :key="item.id" class="item-row">
+                  <span>{{ item.terminalLabel }}（{{ item.terminalKind === "sign" ? "价格牌" : "油枪" }}）</span>
+                  <span class="pill" :class="terminalOnline(batch.stationId, item.terminalId) ? 'on' : 'off'">
+                    {{ terminalOnline(batch.stationId, item.terminalId) ? "在线" : "离线" }}
+                  </span>
+                  <span class="pill" :class="item.status">{{ CONFIRM_STATUS_TEXT[item.status] }}</span>
+                  <span>{{ item.confirmer ?? "—" }}</span>
+                  <span>{{ item.confirmedAt ? fmtTime(item.confirmedAt) : "—" }}</span>
+                  <span class="item-actions">
+                    <button
+                      v-if="item.status === 'pending' && batch.status === 'dispatching'"
+                      type="button"
+                      @click="report(batch, item.terminalId)"
+                    >
+                      模拟回报
+                    </button>
+                    <button type="button" class="secondary" @click="toggleOnline(batch.stationId, item.terminalId)">
+                      {{ terminalOnline(batch.stationId, item.terminalId) ? "设为离线" : "恢复在线" }}
+                    </button>
+                  </span>
+                </div>
               </div>
             </article>
           </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
-            </div>
-          </div>
         </section>
+      </section>
+
+      <section class="list-panel history">
+        <h2>挂牌价历史</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>站点</th>
+              <th>油品</th>
+              <th>价格变化</th>
+              <th>批次</th>
+              <th>操作员</th>
+              <th>确认人</th>
+              <th>生效时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in historyRows" :key="row.id">
+              <td>{{ row.stationName }}</td>
+              <td>{{ row.fuel }}</td>
+              <td>{{ fmtPrice(row.oldPrice) }} → {{ fmtPrice(row.price) }}</td>
+              <td>{{ row.batchNo }}</td>
+              <td>{{ row.operator }}</td>
+              <td>{{ row.confirmers }}</td>
+              <td>{{ fmtTime(row.effectiveAt) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </section>
     </div>
   </main>
